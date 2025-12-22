@@ -64,9 +64,28 @@ type ErrorResponse struct {
 }
 
 var (
-	apiKey string
-	model  string
+	apiKey       string
+	defaultModel string
 )
+
+// normalizeModel extracts the base model name (haiku, sonnet, opus)
+func normalizeModel(m string) string {
+	m = strings.ToLower(strings.TrimSpace(m))
+	// Strip common prefixes
+	m = strings.TrimPrefix(m, "claude-")
+	m = strings.TrimPrefix(m, "claude_")
+	// Handle versioned names like "haiku-4-5" -> "haiku"
+	for _, base := range []string{"haiku", "sonnet", "opus"} {
+		if strings.HasPrefix(m, base) {
+			return base
+		}
+	}
+	// If not recognized, return as-is (let claude CLI handle it)
+	if m == "" {
+		return "sonnet" // default
+	}
+	return m
+}
 
 func main() {
 	apiKey = os.Getenv("PROXY_API_KEY")
@@ -74,10 +93,11 @@ func main() {
 		log.Fatal("PROXY_API_KEY environment variable required")
 	}
 
-	model = os.Getenv("CLAUDE_MODEL")
-	if model == "" {
-		model = "haiku" // Default to haiku (fast and cheap)
+	defaultModel = os.Getenv("CLAUDE_MODEL")
+	if defaultModel == "" {
+		defaultModel = "sonnet" // Default to sonnet
 	}
+	defaultModel = normalizeModel(defaultModel)
 
 	port := os.Getenv("PORT")
 	if port == "" {
@@ -89,7 +109,7 @@ func main() {
 		w.Write([]byte("ok"))
 	})
 
-	log.Printf("Claude Code proxy starting on :%s (model: %s)", port, model)
+	log.Printf("Claude Code proxy starting on :%s (default model: %s)", port, defaultModel)
 	log.Fatal(http.ListenAndServe(":"+port, nil))
 }
 
@@ -138,14 +158,20 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	// Determine model: use request model if provided, otherwise default
+	requestModel := normalizeModel(req.Model)
+	if requestModel == "" {
+		requestModel = defaultModel
+	}
+
 	// Call Claude Code CLI
 	cmd := exec.Command("claude",
 		"--print",
-		"--model", model,
+		"--model", requestModel,
 	)
 	cmd.Stdin = strings.NewReader(prompt.String())
 
-	log.Printf("Processing request (%d messages, %d chars)", len(req.Messages), len(prompt.String()))
+	log.Printf("Processing request (model: %s, %d messages, %d chars)", requestModel, len(req.Messages), len(prompt.String()))
 	start := time.Now()
 
 	output, err := cmd.Output()
@@ -167,7 +193,7 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
 		Object:  "chat.completion",
 		Created: time.Now().Unix(),
-		Model:   "claude-" + model,
+		Model:   requestModel,
 		Choices: []Choice{
 			{
 				Index: 0,
