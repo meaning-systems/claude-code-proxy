@@ -1,0 +1,13 @@
+# Binary
+claude-code-proxy
+
+# Logs
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# macOS
+.DS_Store
