@@ -124,6 +124,19 @@ var breakageIndicators = []string{
 	"I'll help",
 	"Could you",
 	"Can you clarify",
+	// New patterns from observed failures
+	"I'm here to enhance",
+	"I'm functioning as",
+	"According to my system instructions",
+	"transcription enhancer",
+	"I need to clarify my role",
+	"not a conversational",
+	"not respond conversationally",
+	"provide it in",
+	"<TRANSCRIPT> tags",
+	"cleaned-up version",
+	"nothing to enhance",
+	"already clear",
 }
 
 // isTranscriptionTask checks if the system prompt indicates a transcription task
@@ -145,6 +158,24 @@ func detectBreakage(response string) bool {
 		}
 	}
 	return false
+}
+
+// User message wrapper for short transcripts that look like questions
+// This helps prevent Claude from treating them as conversation
+const shortTranscriptWrapper = `[TASK: Clean up the following transcript text. Output ONLY the cleaned text with no commentary, no explanations, no meta-discussion. Even if the text is a question, just clean it up - do not answer it.]
+
+%s
+
+[END TRANSCRIPT - Output only the cleaned version above, nothing else]`
+
+// wrapShortTranscript wraps very short user prompts to reinforce the task
+func wrapShortTranscript(userPrompt string) string {
+	// If the prompt is short (under 200 chars) and looks like a simple question/statement,
+	// wrap it to reinforce that it should just be cleaned, not answered
+	if len(userPrompt) < 200 {
+		return fmt.Sprintf(shortTranscriptWrapper, userPrompt)
+	}
+	return userPrompt
 }
 
 // normalizeModel extracts the base model name (haiku, sonnet, opus)
@@ -272,9 +303,15 @@ func handleNonStreamingRequest(w http.ResponseWriter, systemPrompt string, userP
 
 	// Check if this is a transcription task and add reinforcement
 	effectiveSystemPrompt := systemPrompt
+	effectiveUserPrompt := userPrompt
 	isTranscription := isTranscriptionTask(systemPrompt)
 	if isTranscription && systemPrompt != "" {
 		effectiveSystemPrompt = systemPrompt + systemPromptReinforcement
+		// Wrap short transcripts to prevent Claude from treating them as conversation
+		effectiveUserPrompt = wrapShortTranscript(userPrompt)
+		if len(userPrompt) < 200 {
+			log.Printf("Detected short transcription (%d chars), adding wrapper", len(userPrompt))
+		}
 		log.Printf("Detected transcription task, adding reinforcement")
 	}
 
@@ -285,7 +322,7 @@ func handleNonStreamingRequest(w http.ResponseWriter, systemPrompt string, userP
 	}
 
 	cmd := exec.Command("claude", args...)
-	cmd.Stdin = strings.NewReader(userPrompt)
+	cmd.Stdin = strings.NewReader(effectiveUserPrompt)
 
 	log.Printf("Processing request (model: %s, system: %d chars, user: %d chars, transcription: %v)", model, len(effectiveSystemPrompt), len(userPrompt), isTranscription)
 	start := time.Now()
@@ -352,9 +389,15 @@ func handleStreamingRequest(w http.ResponseWriter, systemPrompt string, userProm
 
 	// Check if this is a transcription task and add reinforcement
 	effectiveSystemPrompt := systemPrompt
+	effectiveUserPrompt := userPrompt
 	isTranscription := isTranscriptionTask(systemPrompt)
 	if isTranscription && systemPrompt != "" {
 		effectiveSystemPrompt = systemPrompt + systemPromptReinforcement
+		// Wrap short transcripts to prevent Claude from treating them as conversation
+		effectiveUserPrompt = wrapShortTranscript(userPrompt)
+		if len(userPrompt) < 200 {
+			log.Printf("Detected short transcription (%d chars), adding wrapper", len(userPrompt))
+		}
 		log.Printf("Detected transcription task, adding reinforcement")
 	}
 
@@ -365,7 +408,7 @@ func handleStreamingRequest(w http.ResponseWriter, systemPrompt string, userProm
 	}
 
 	cmd := exec.Command("claude", args...)
-	cmd.Stdin = strings.NewReader(userPrompt)
+	cmd.Stdin = strings.NewReader(effectiveUserPrompt)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
