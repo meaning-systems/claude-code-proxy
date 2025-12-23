@@ -163,22 +163,37 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Build prompt from messages
-	var prompt strings.Builder
+	// Log incoming messages for debugging
+	log.Printf("=== INCOMING REQUEST ===")
+	log.Printf("Model requested: %s", req.Model)
+	log.Printf("Stream: %v", req.Stream)
+	log.Printf("Messages count: %d", len(req.Messages))
+	for i, msg := range req.Messages {
+		log.Printf("  [%d] role=%s, content_len=%d", i, msg.Role, len(msg.Content))
+	}
+
+	// Separate system prompt from conversation messages
+	var systemPrompt strings.Builder
+	var userPrompt strings.Builder
+
 	for _, msg := range req.Messages {
 		switch msg.Role {
 		case "system":
-			prompt.WriteString(msg.Content)
-			prompt.WriteString("\n\n")
+			if systemPrompt.Len() > 0 {
+				systemPrompt.WriteString("\n\n")
+			}
+			systemPrompt.WriteString(msg.Content)
 		case "user":
-			prompt.WriteString(msg.Content)
-			prompt.WriteString("\n")
+			userPrompt.WriteString(msg.Content)
+			userPrompt.WriteString("\n")
 		case "assistant":
-			prompt.WriteString("[Previous response: ")
-			prompt.WriteString(msg.Content)
-			prompt.WriteString("]\n")
+			userPrompt.WriteString("[Previous response: ")
+			userPrompt.WriteString(msg.Content)
+			userPrompt.WriteString("]\n")
 		}
 	}
+
+	log.Printf("System prompt: %d chars, User prompt: %d chars", systemPrompt.Len(), userPrompt.Len())
 
 	// Determine model: use request model if provided, otherwise default
 	requestModel := normalizeModel(req.Model)
@@ -187,22 +202,25 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 	}
 
 	if req.Stream {
-		handleStreamingRequest(w, prompt.String(), requestModel)
+		handleStreamingRequest(w, systemPrompt.String(), userPrompt.String(), requestModel)
 	} else {
-		handleNonStreamingRequest(w, prompt.String(), requestModel)
+		handleNonStreamingRequest(w, systemPrompt.String(), userPrompt.String(), requestModel)
 	}
 }
 
-func handleNonStreamingRequest(w http.ResponseWriter, prompt string, model string) {
+func handleNonStreamingRequest(w http.ResponseWriter, systemPrompt string, userPrompt string, model string) {
 	w.Header().Set("Content-Type", "application/json")
 
-	cmd := exec.Command("claude",
-		"--print",
-		"--model", model,
-	)
-	cmd.Stdin = strings.NewReader(prompt)
+	// Build command with proper system prompt separation
+	args := []string{"--print", "--model", model}
+	if systemPrompt != "" {
+		args = append(args, "--system-prompt", systemPrompt)
+	}
 
-	log.Printf("Processing request (model: %s, %d chars)", model, len(prompt))
+	cmd := exec.Command("claude", args...)
+	cmd.Stdin = strings.NewReader(userPrompt)
+
+	log.Printf("Processing request (model: %s, system: %d chars, user: %d chars)", model, len(systemPrompt), len(userPrompt))
 	start := time.Now()
 
 	output, err := cmd.Output()
@@ -219,6 +237,7 @@ func handleNonStreamingRequest(w http.ResponseWriter, prompt string, model strin
 	response := strings.TrimSpace(string(output))
 	log.Printf("Response received in %v (%d chars)", elapsed, len(response))
 
+	totalPrompt := len(systemPrompt) + len(userPrompt)
 	resp := ChatResponse{
 		ID:      fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano()),
 		Object:  "chat.completion",
@@ -235,16 +254,16 @@ func handleNonStreamingRequest(w http.ResponseWriter, prompt string, model strin
 			},
 		},
 		Usage: Usage{
-			PromptTokens:     len(prompt) / 4,
+			PromptTokens:     totalPrompt / 4,
 			CompletionTokens: len(response) / 4,
-			TotalTokens:      (len(prompt) + len(response)) / 4,
+			TotalTokens:      (totalPrompt + len(response)) / 4,
 		},
 	}
 
 	json.NewEncoder(w).Encode(resp)
 }
 
-func handleStreamingRequest(w http.ResponseWriter, prompt string, model string) {
+func handleStreamingRequest(w http.ResponseWriter, systemPrompt string, userPrompt string, model string) {
 	// Set SSE headers
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.Header().Set("Cache-Control", "no-cache")
@@ -257,13 +276,14 @@ func handleStreamingRequest(w http.ResponseWriter, prompt string, model string) 
 		return
 	}
 
-	cmd := exec.Command("claude",
-		"--print",
-		"--model", model,
-		"--output-format", "stream-json",
-		"--verbose",
-	)
-	cmd.Stdin = strings.NewReader(prompt)
+	// Build command with proper system prompt separation
+	args := []string{"--print", "--model", model, "--output-format", "stream-json", "--verbose"}
+	if systemPrompt != "" {
+		args = append(args, "--system-prompt", systemPrompt)
+	}
+
+	cmd := exec.Command("claude", args...)
+	cmd.Stdin = strings.NewReader(userPrompt)
 
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
@@ -272,7 +292,7 @@ func handleStreamingRequest(w http.ResponseWriter, prompt string, model string) 
 		return
 	}
 
-	log.Printf("Processing streaming request (model: %s, %d chars)", model, len(prompt))
+	log.Printf("Processing streaming request (model: %s, system: %d chars, user: %d chars)", model, len(systemPrompt), len(userPrompt))
 	start := time.Now()
 
 	if err := cmd.Start(); err != nil {
