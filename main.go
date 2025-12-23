@@ -88,6 +88,65 @@ var (
 	defaultModel string
 )
 
+// System prompt reinforcement for transcription-like tasks
+// This helps prevent Claude from breaking character and responding conversationally
+const systemPromptReinforcement = `
+
+CRITICAL REMINDER: You must follow the system instructions above exactly.
+- Do NOT ask clarifying questions
+- Do NOT respond conversationally
+- Do NOT add explanations or metadata
+- ONLY output the result as specified in the instructions above`
+
+// Patterns that indicate this is a transcription/enhancement task
+var transcriptionIndicators = []string{
+	"TRANSCRIPTION",
+	"TRANSCRIPT",
+	"transcription enhancer",
+	"clean up",
+	"cleaned text",
+	"OUTPUT ONLY",
+}
+
+// Patterns that indicate Claude broke character (for logging)
+var breakageIndicators = []string{
+	"I need clarification",
+	"I appreciate",
+	"I understand",
+	"I can help",
+	"I can see",
+	"**Which",
+	"**What",
+	"1. **",
+	"2. **",
+	"Let me",
+	"Here's",
+	"I'll help",
+	"Could you",
+	"Can you clarify",
+}
+
+// isTranscriptionTask checks if the system prompt indicates a transcription task
+func isTranscriptionTask(systemPrompt string) bool {
+	lowerPrompt := strings.ToLower(systemPrompt)
+	for _, indicator := range transcriptionIndicators {
+		if strings.Contains(lowerPrompt, strings.ToLower(indicator)) {
+			return true
+		}
+	}
+	return false
+}
+
+// detectBreakage checks if the response looks like Claude broke character
+func detectBreakage(response string) bool {
+	for _, indicator := range breakageIndicators {
+		if strings.Contains(response, indicator) {
+			return true
+		}
+	}
+	return false
+}
+
 // normalizeModel extracts the base model name (haiku, sonnet, opus)
 func normalizeModel(m string) string {
 	m = strings.ToLower(strings.TrimSpace(m))
@@ -211,16 +270,24 @@ func handleChat(w http.ResponseWriter, r *http.Request) {
 func handleNonStreamingRequest(w http.ResponseWriter, systemPrompt string, userPrompt string, model string) {
 	w.Header().Set("Content-Type", "application/json")
 
+	// Check if this is a transcription task and add reinforcement
+	effectiveSystemPrompt := systemPrompt
+	isTranscription := isTranscriptionTask(systemPrompt)
+	if isTranscription && systemPrompt != "" {
+		effectiveSystemPrompt = systemPrompt + systemPromptReinforcement
+		log.Printf("Detected transcription task, adding reinforcement")
+	}
+
 	// Build command with proper system prompt separation
 	args := []string{"--print", "--model", model}
-	if systemPrompt != "" {
-		args = append(args, "--system-prompt", systemPrompt)
+	if effectiveSystemPrompt != "" {
+		args = append(args, "--system-prompt", effectiveSystemPrompt)
 	}
 
 	cmd := exec.Command("claude", args...)
 	cmd.Stdin = strings.NewReader(userPrompt)
 
-	log.Printf("Processing request (model: %s, system: %d chars, user: %d chars)", model, len(systemPrompt), len(userPrompt))
+	log.Printf("Processing request (model: %s, system: %d chars, user: %d chars, transcription: %v)", model, len(effectiveSystemPrompt), len(userPrompt), isTranscription)
 	start := time.Now()
 
 	output, err := cmd.Output()
@@ -236,6 +303,13 @@ func handleNonStreamingRequest(w http.ResponseWriter, systemPrompt string, userP
 	elapsed := time.Since(start)
 	response := strings.TrimSpace(string(output))
 	log.Printf("Response received in %v (%d chars)", elapsed, len(response))
+
+	// Log if we detect breakage (Claude broke character)
+	if isTranscription && detectBreakage(response) {
+		log.Printf("WARNING: Detected possible breakage in transcription response")
+		log.Printf("User prompt was: %s", userPrompt)
+		log.Printf("Response was: %.500s", response)
+	}
 
 	totalPrompt := len(systemPrompt) + len(userPrompt)
 	resp := ChatResponse{
@@ -276,10 +350,18 @@ func handleStreamingRequest(w http.ResponseWriter, systemPrompt string, userProm
 		return
 	}
 
+	// Check if this is a transcription task and add reinforcement
+	effectiveSystemPrompt := systemPrompt
+	isTranscription := isTranscriptionTask(systemPrompt)
+	if isTranscription && systemPrompt != "" {
+		effectiveSystemPrompt = systemPrompt + systemPromptReinforcement
+		log.Printf("Detected transcription task, adding reinforcement")
+	}
+
 	// Build command with proper system prompt separation
 	args := []string{"--print", "--model", model, "--output-format", "stream-json", "--verbose"}
-	if systemPrompt != "" {
-		args = append(args, "--system-prompt", systemPrompt)
+	if effectiveSystemPrompt != "" {
+		args = append(args, "--system-prompt", effectiveSystemPrompt)
 	}
 
 	cmd := exec.Command("claude", args...)
@@ -292,7 +374,7 @@ func handleStreamingRequest(w http.ResponseWriter, systemPrompt string, userProm
 		return
 	}
 
-	log.Printf("Processing streaming request (model: %s, system: %d chars, user: %d chars)", model, len(systemPrompt), len(userPrompt))
+	log.Printf("Processing streaming request (model: %s, system: %d chars, user: %d chars, transcription: %v)", model, len(effectiveSystemPrompt), len(userPrompt), isTranscription)
 	start := time.Now()
 
 	if err := cmd.Start(); err != nil {
